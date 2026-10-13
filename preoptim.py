@@ -28,3 +28,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# napsat interreziduální interakce
+# napsat dihedrální úhly pro vodíky
+# napsat volbu pro variabilní vodíky

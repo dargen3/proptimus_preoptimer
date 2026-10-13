@@ -18,9 +18,10 @@ def extract_structural_data(structures_dir): # smazat rrr
         with open(preprocessed_data_json, "r", encoding="utf-8") as f:
             data = json.load(f)
     else:
-        proteins = [Protein(file) for file in list(pdb_files)[:5]]
+        proteins = [Protein(file) for file in list(pdb_files)]
         data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         for i, protein in enumerate(proteins):
+            print(i)
             protein.assign_atomic_types()
             protein.get_lenghts_angles()
             for residue in protein.residues:
@@ -85,7 +86,7 @@ def calculate_parameters(structures_dir, data, at_types):
 
 
 
-res = "ALA"
+res = "GLY"
 structures_dir = "optimized_proteins"
 data = extract_structural_data(structures_dir)
 
