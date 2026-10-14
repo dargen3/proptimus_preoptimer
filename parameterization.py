@@ -86,7 +86,7 @@ def calculate_parameters(structures_dir, data, at_types):
 
 
 
-res = "GLY"
+res = "ALA"
 structures_dir = "optimized_proteins"
 data = extract_structural_data(structures_dir)
 

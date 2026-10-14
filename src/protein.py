@@ -27,38 +27,7 @@ class Protein:
         self._assign_formal_charges()
 
 
-    #
-    # def _assign_hydrogen_bonds(self):
-    #     import biotite.structure as struc
-    #     import biotite.structure.io as strucio
-    #
-    #     biotite_structure = strucio.load_structure(self.pdb_file,
-    #                                                extra_fields=["charge"],
-    #                                                include_bonds=True,
-    #                                                model=1)
-    #     hbonds = struc.hbond(biotite_structure, cutoff_dist=3.5)
-    #     atoms = list(self.structure.get_atoms())
-    #     for donor_i, hydrogen_i, acceptor_i in hbonds:
-    #         atom = atoms[hydrogen_i]
-    #         if not getattr(atom, "atom_type", False):
-    #             continue
-    #         if atom.atom_type[-7:] != "/hbondH":
-    #             atom.atom_type += "/hbondH"
 
-        # for donor_i, hydrogen_i, acceptor_i in hbonds:
-        #     atom = atoms[donor_i]
-        #     if not getattr(atom, "atom_type", False):
-        #         continue
-        #     if atom.atom_type[-7:] != "/hbondD":
-        #         atom.atom_type += "/hbondD"
-        #
-        # for donor_i, hydrogen_i, acceptor_i in hbonds:
-        #
-        #     atom = atoms[acceptor_i]
-        #     if not getattr(atom, "atom_type", False):
-        #         continue
-        #     if atom.atom_type[-7:] != "/hbondA":
-        #         atom.atom_type += "/hbondA"
 
 
 
@@ -72,8 +41,13 @@ class Protein:
             parameters = json.load(f)
         for res_i, residue in enumerate(self.residues):
             for atom in residue.get_atoms():
+                if atom.name in ["C", "N", "O", "H"]:
+                    continue
+
                 if not getattr(atom, "atom_type", False):
                     continue
+
+
                 a2, a3, a4 = self._get_ancestors(atom)
 
                 atom_parameters = parameters[residue.resname][atom.atom_type]
@@ -191,24 +165,68 @@ class Protein:
                 if not getattr(atom, "atom_type", False):
                     continue
                 atom_parameters = parameters[residue.resname][atom.atom_type]
-
                 if "dihedral_angle" in atom_parameters:
                     a2, a3, a4 = self._get_ancestors(atom)
-                    if atom.atom_type.split("/")[0] == "O":
-                        atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, residue[a3].coord,
-                                                           self.residues[res_i + 1][a4].coord,
-                                                           atom_parameters["bond_length"],
-                                                           atom_parameters["bond_angle"],
-                                                           atom_parameters["dihedral_angle"], invertovat_chiralitu=True)
+                    if atom.name in ["C", "N", "O", "H"]:
+                        continue
+                    dihedral_angle_parameters = atom_parameters["dihedral_angle"]
+                    if "ancestors_type" in atomic_types[residue.resname][atom.atom_type.split("/")[0]]:
+                        test = np.degrees(vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(), residue[a3].get_vector(), residue[a4].get_vector()))
+                        ddd = predict_cluster_from_centers(test, dihedral_angle_parameters)
+                        atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, residue[a3].coord, residue[a4].coord, atom_parameters["bond_length"], atom_parameters["bond_angle"], ddd, invertovat_chiralitu=True)
 
-                    else:
+        # C a N
+        for res_i, residue in enumerate(self.residues):
+            for atom in residue.get_atoms():
+                if not getattr(atom, "atom_type", False):
+                    continue
+                atom_parameters = parameters[residue.resname][atom.atom_type]
+                a2, a3, a4 = self._get_ancestors(atom)
+                if atom.name == "C":
+                    dihedral_angle = np.degrees(
+                        vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(),
+                                              self.residues[res_i + 1][a3].get_vector(),
+                                              self.residues[res_i + 1][a4].get_vector()))
+                    atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, self.residues[res_i + 1][a3].coord,
+                                                       self.residues[res_i + 1][a4].coord,
+                                                       atom_parameters["bond_length"],
+                                                       atom_parameters["bond_angle"], dihedral_angle,
+                                                       invertovat_chiralitu=True)
 
-                        dihedral_angle_parameters = atom_parameters["dihedral_angle"]
-                        if "ancestors_type" in atomic_types[residue.resname][atom.atom_type.split("/")[0]]:
-                            test = np.degrees(vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(), residue[a3].get_vector(), residue[a4].get_vector()))
-                            ddd = predict_cluster_from_centers(test, dihedral_angle_parameters)
-                            atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, residue[a3].coord, residue[a4].coord, atom_parameters["bond_length"], atom_parameters["bond_angle"], ddd, invertovat_chiralitu=True)
+                if atom.name == "N":
+                    dihedral_angle = np.degrees(
+                        vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(),
+                                              self.residues[res_i - 1][a3].get_vector(),
+                                              self.residues[res_i - 1][a4].get_vector()))
+                    atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, self.residues[res_i - 1][a3].coord,
+                                                       self.residues[res_i - 1][a4].coord,
+                                                       atom_parameters["bond_length"],
+                                                       atom_parameters["bond_angle"], dihedral_angle,
+                                                       invertovat_chiralitu=True)
 
+        # O a H
+        for res_i, residue in enumerate(self.residues):
+            for atom in residue.get_atoms():
+                if not getattr(atom, "atom_type", False):
+                    continue
+                atom_parameters = parameters[residue.resname][atom.atom_type]
+                a2, a3, a4 = self._get_ancestors(atom)
+                if atom.name == "O":
+                    atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, residue[a3].coord,
+                                                       self.residues[res_i + 1][a4].coord,
+                                                       atom_parameters["bond_length"],
+                                                       atom_parameters["bond_angle"],
+                                                       atom_parameters["dihedral_angle"], invertovat_chiralitu=True)
+                if atom.name == "H":
+                    dihedral_angle = np.degrees(
+                        vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(),
+                                              residue[a3].get_vector(),
+                                              self.residues[res_i - 1][a4].get_vector()))
+                    atom.coord = vypocet_ctvrteho_bodu(residue[a2].coord, residue[a3].coord,
+                                                       self.residues[res_i - 1][a4].coord,
+                                                       atom_parameters["bond_length"],
+                                                       atom_parameters["bond_angle"], dihedral_angle,
+                                                       invertovat_chiralitu=True)
 
 
 
@@ -232,12 +250,18 @@ class Protein:
                     continue
                 if atom.name == "O" and residue is self.residues[-1]:  # last residue, dodělat atomový typ
                     continue
+                if atom.name == "C" and residue is self.residues[-1]:  # last residue, dodělat atomový typ
+                    continue
+                if atom.name == "N" and residue == self.residues[0]:  # last residue, dodělat atomový typ
+                    continue
                 atom.atom_type = at_types_lookup[residue.resname][atom.name]
 
 
     def _assign_histidine_types(self):
         for residue in self.residues:
             for atom in residue.get_atoms():
+                if not getattr(atom, "atom_type", False):
+                    continue
                 if residue.resname == "HIS" and atom.name == "CE1":
                     near_HH = [near_atom.name for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
                                   residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
@@ -380,13 +404,20 @@ class Protein:
 
 
                     # bond angle
-                    if atom.name in ["CB", "H", "HA", "HA2", "HA3", "O"]: # atoms directly bonded to backbone
+                    if atom.name == "C":
+                        atom.bond_angle = np.degrees(vectors.calc_angle(atom.get_vector(), residue[a2].get_vector(), self.residues[res_i + 1][a3].get_vector()))
+                    elif atom.name == "N":
+                        atom.bond_angle = np.degrees(vectors.calc_angle(atom.get_vector(), residue[a2].get_vector(), self.residues[res_i - 1][a3].get_vector()))
+                    elif atom.name in ["CB", "H", "HA", "HA2", "HA3", "O", "N"]: # atoms directly bonded to backbone
                         if atom.name in ["CB", "O"]: # bacause of biopython
                             atom.bond_angle = residue.internal_coord.get_angle(f"{a3}:{a2}:{atom.name}")
                         else:
                             atom.bond_angle = residue.internal_coord.get_angle(f"{atom.name}:{a2}:{a3}")
                     else:
                         atom.bond_angle = residue.internal_coord.get_angle(f"{a3}:{a2}:{atom.name}")
+
+
+
 
                     # dihedral angle
                     if "ancestors_type" in atomic_types[residue.resname][atom.atom_type.split("/")[0]]:
@@ -395,6 +426,20 @@ class Protein:
                                 vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(),
                                                       residue[a3].get_vector(),
                                                       self.residues[res_i + 1][a4].get_vector()))
+                        elif atom.name == "C":
+                            atom.dihedral_angle = np.degrees(
+                                vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(),
+                                                      self.residues[res_i + 1][a3].get_vector(),
+                                                      self.residues[res_i + 1][a4].get_vector()))
+                        elif atom.name == "N":
+                            atom.dihedral_angle = np.degrees(
+                                vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(),
+                                                      self.residues[res_i - 1][a3].get_vector(),
+                                                      self.residues[res_i - 1][a4].get_vector()))
+
+
+
+
                         else:
                             atom.dihedral_angle = np.degrees(vectors.calc_dihedral(atom.get_vector(), residue[a2].get_vector(), residue[a3].get_vector(), residue[a4].get_vector()))
 
