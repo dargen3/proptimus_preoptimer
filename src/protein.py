@@ -4,6 +4,7 @@ from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors # ve
 from .data import unprocessed_atoms, atomic_types, at_types_lookup
 import json
 
+
 warnings.filterwarnings(
     "ignore",
     category=UserWarning,
@@ -13,30 +14,149 @@ warnings.filterwarnings(
 
 class Protein:
     def __init__(self,
-                 pdb_file):
+                 pdb_file, output=True):
+        if output:
+            print(f"Loading protein from {pdb_file}...", end="")
         self.pdb_file = pdb_file
         self.original_structure = PDBParser(QUIET=True).get_structure(id="structure", file=pdb_file)
         self.structure = PDBParser(QUIET=True).get_structure(id="structure", file=pdb_file)
         self.structure.atom_to_internal_coordinates()
         self.residues = list(self.structure.get_residues())
 
-    def assign_atomic_types(self):
+        # assign atomic types
         self.kdtree = NeighborSearch(list(self.structure.get_atoms()))
         self._assign_basic_atomic_types()
         self._assign_histidine_types()
         self._assign_formal_charges()
+        if output:
+            print(" ok")
 
+    def _assign_basic_atomic_types(self):
+        for residue_i, residue in enumerate(self.residues):
+            for atom in residue.get_atoms():
+                if atom.name in unprocessed_atoms:
+                    continue
+                if residue.resname == "CYS" and atom.name == "SG":  # skip -SS- bridges
+                    near_SG = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2.2, level="A")
+                               if near_atom.name == "SG"]
+                    if len(near_SG) == 2:
+                        continue
+                if atom.name == "H" and residue_i == 0:
+                    continue
+                if atom.name == "O" and residue is self.residues[-1]:
+                    continue
+                if atom.name == "C" and residue is self.residues[-1]:
+                    continue
+                if atom.name == "N" and residue_i == 0:
+                    continue
+                atom.atom_type = at_types_lookup[residue.resname][atom.name]
 
+    def _assign_histidine_types(self):
+        for residue in self.residues:
+            for atom in residue.get_atoms():
+                if not getattr(atom, "atom_type", False):
+                    continue
+                if residue.resname == "HIS" and atom.name == "CE1":
+                    near_HH = [near_atom.name for near_atom in
+                               self.kdtree.search(center=atom.coord, radius=4, level="A") if
+                               residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
+                    if near_HH == ["HD1"]:
+                        atom.atom_type += "/HID"
+                        residue["CD2"].atom_type += "/HID"
+                        residue["ND1"].atom_type += "/HID"
+                        residue["NE2"].atom_type += "/HID"
+                        residue["HD1"].atom_type += "/HID"
+                    elif near_HH == ["HE2"]:
+                        atom.atom_type += "/HIE"
+                        residue["CD2"].atom_type += "/HIE"
+                        residue["ND1"].atom_type += "/HIE"
+                        residue["NE2"].atom_type += "/HIE"
+                        residue["HE2"].atom_type += "/HIE"
 
+    def _assign_formal_charges(self):
+        for residue in self.residues:
+            for atom in residue.get_atoms():
+                if not getattr(atom, "atom_type", False):
+                    continue
 
+                if residue.resname == "LYS" and atom.name == "NZ":
+                    near_HZ = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
+                               residue == near_atom.get_parent() and near_atom.name[:2] == "HZ"]
+                    if len(near_HZ) == 3:
+                        atom.atom_type += "/+1"
+                        for atom in near_HZ:
+                            atom.atom_type += "/+1"
 
+                if residue.resname == "ASP" and atom.name == "OD2":
+                    near_HD2 = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
+                                residue == near_atom.get_parent() and near_atom.name == "HD2"]
+                    if len(near_HD2) == 0:
+                        atom.atom_type += "/-1"
+                        residue["OD1"].atom_type += "/-1"
+                        residue["CG"].atom_type += "/-1"
+
+                if residue.resname == "GLU" and atom.name == "OE2":
+                    near_HE2 = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
+                                residue == near_atom.get_parent() and near_atom.name == "HE2"]
+                    if len(near_HE2) == 0:
+                        atom.atom_type += "/-1"
+                        residue["OE1"].atom_type += "/-1"
+                        residue["CD"].atom_type += "/-1"
+
+                if residue.resname == "CYS" and atom.name == "SG":
+                    near_HG = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
+                               residue == near_atom.get_parent() and near_atom.name == "HG"]
+                    if len(near_HG) == 0:
+                        atom.atom_type += "/-1"
+
+                if residue.resname == "TYR" and atom.name == "OH":  # možná pořešit i aromatický cyklus?
+                    near_HH = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
+                               residue == near_atom.get_parent() and near_atom.name == "HH"]
+                    if len(near_HH) == 0:
+                        atom.atom_type += "/-1"
+                        residue["CZ"].atom_type += "/-1"
+                        residue["CE1"].atom_type += "/-1"
+                        residue["CE2"].atom_type += "/-1"
+                        residue["CD1"].atom_type += "/-1"
+                        residue["CD2"].atom_type += "/-1"
+
+                if residue.resname == "ARG" and atom.name == "CZ":
+                    near_H = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
+                              residue == near_atom.get_parent() and near_atom.name in ["HE", "HH11", "HH12", "HH21",
+                                                                                       "HH22"]]
+                    if len(near_H) == 5:
+                        atom.atom_type += "/+1"
+                        residue["NE"].atom_type += "/+1"
+                        residue["HE"].atom_type += "/+1"
+                        residue["NH1"].atom_type += "/+1"
+                        residue["NH2"].atom_type += "/+1"
+                        residue["HH11"].atom_type += "/+1"
+                        residue["HH12"].atom_type += "/+1"
+                        residue["HH21"].atom_type += "/+1"
+                        residue["HH22"].atom_type += "/+1"
+
+                if residue.resname == "HIS" and atom.name == "CE1":
+                    near_HH = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
+                               residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
+                    if len(near_HH) == 2:
+                        atom.atom_type += "/+1"
+                        residue["CD2"].atom_type += "/+1"
+                        residue["ND1"].atom_type += "/+1"
+                        residue["NE2"].atom_type += "/+1"
+                        try:
+                            residue["HE2"].atom_type += "/+1"
+                        except KeyError:
+                            pass
+                        try:
+                            residue["HD1"].atom_type += "/+1"
+                        except KeyError:
+                            pass
 
 
 
 
     def preoptimize(self, parameters):
-        self.assign_atomic_types()
-
+        print("Setting bond lengths, bond angles and dihedral angles... ", end="")
         with open("optimized_proteins/parameters.json", "r", encoding="utf-8") as f:
             parameters = json.load(f)
         for res_i, residue in enumerate(self.residues):
@@ -110,17 +230,6 @@ class Protein:
         sup.apply(self.structure)
 
         def vypocet_ctvrteho_bodu(a1, a2, a3, d, u, du, v_stupnich=True, invertovat_chiralitu=False):
-            """
-            Vypočítá souřadnice čtvrtého bodu a4.
-
-            Parametry:
-            - a1, a2, a3: souřadnice [x, y, z]
-            - d: vzdálenost
-            - u: vazebný úhel
-            - du: dihedrální úhel
-            - v_stupnich: True pro stupně, False pro radiány
-            - invertovat_chiralitu: True pro zrcadlení výsledku (řeší opačnou orientaci)
-            """
             a1 = np.array(a1, dtype=float)
             a2 = np.array(a2, dtype=float)
             a3 = np.array(a3, dtype=float)
@@ -229,135 +338,15 @@ class Protein:
                                                        invertovat_chiralitu=True)
 
 
-
+        print("ok")
 
 
     def save(self, output_PDB_file):
+        print(f"Saving preoptimized protein to {output_PDB_file}... ", end="")
         io = PDBIO()
         io.set_structure(self.structure)
         io.save(output_PDB_file)
-
-    def _assign_basic_atomic_types(self):
-        for residue_i, residue in enumerate(self.residues):
-            for atom in residue.get_atoms():
-                if atom.name in unprocessed_atoms:
-                    continue
-                if residue.resname == "CYS" and atom.name == "SG": # skip -SS- bridges
-                    near_SG = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2.2, level="A") if near_atom.name == "SG"]
-                    if len(near_SG) == 2:
-                        continue
-                if atom.name == "H" and residue_i == 0:  # first residue, dodělat atomový typ
-                    continue
-                if atom.name == "O" and residue is self.residues[-1]:  # last residue, dodělat atomový typ
-                    continue
-                if atom.name == "C" and residue is self.residues[-1]:  # last residue, dodělat atomový typ
-                    continue
-                if atom.name == "N" and residue == self.residues[0]:  # last residue, dodělat atomový typ
-                    continue
-                atom.atom_type = at_types_lookup[residue.resname][atom.name]
-
-
-    def _assign_histidine_types(self):
-        for residue in self.residues:
-            for atom in residue.get_atoms():
-                if not getattr(atom, "atom_type", False):
-                    continue
-                if residue.resname == "HIS" and atom.name == "CE1":
-                    near_HH = [near_atom.name for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
-                    if near_HH == ["HD1"]:
-                        atom.atom_type += "/HID"
-                        residue["CD2"].atom_type += "/HID"
-                        residue["ND1"].atom_type += "/HID"
-                        residue["NE2"].atom_type += "/HID"
-                        residue["HD1"].atom_type += "/HID"
-                    elif near_HH == ["HE2"]:
-                        atom.atom_type += "/HIE"
-                        residue["CD2"].atom_type += "/HIE"
-                        residue["ND1"].atom_type += "/HIE"
-                        residue["NE2"].atom_type += "/HIE"
-                        residue["HE2"].atom_type += "/HIE"
-
-
-    def _assign_formal_charges(self):
-        for residue in self.residues:
-            for atom in residue.get_atoms():
-                if not getattr(atom, "atom_type", False):
-                    continue
-
-                if residue.resname == "LYS" and atom.name == "NZ":
-                    near_HZ = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name[:2] == "HZ"]
-                    if len(near_HZ) == 3:
-                        atom.atom_type += "/+1"
-                        for atom in near_HZ:
-                            atom.atom_type += "/+1"
-
-                if residue.resname == "ASP" and atom.name == "OD2":
-                    near_HD2 = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name == "HD2"]
-                    if len(near_HD2) == 0:
-                        atom.atom_type += "/-1"
-                        residue["OD1"].atom_type += "/-1"
-                        residue["CG"].atom_type += "/-1"
-
-                if residue.resname == "GLU" and atom.name == "OE2":
-                    near_HE2 = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name == "HE2"]
-                    if len(near_HE2) == 0:
-                        atom.atom_type += "/-1"
-                        residue["OE1"].atom_type += "/-1"
-                        residue["CD"].atom_type += "/-1"
-
-                if residue.resname == "CYS" and atom.name == "SG":
-                    near_HG = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name == "HG"]
-                    if len(near_HG) == 0:
-                        atom.atom_type += "/-1"
-
-                if residue.resname == "TYR" and atom.name == "OH":  # možná pořešit i aromatický cyklus?
-                    near_HH = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name == "HH"]
-                    if len(near_HH) == 0:
-                        atom.atom_type += "/-1"
-                        residue["CZ"].atom_type += "/-1"
-                        residue["CE1"].atom_type += "/-1"
-                        residue["CE2"].atom_type += "/-1"
-                        residue["CD1"].atom_type += "/-1"
-                        residue["CD2"].atom_type += "/-1"
-
-
-
-                if residue.resname == "ARG" and atom.name == "CZ":
-                    near_H = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name in ["HE", "HH11", "HH12", "HH21", "HH22"]]
-                    if len(near_H) == 5:
-                        atom.atom_type += "/+1"
-                        residue["NE"].atom_type += "/+1"
-                        residue["HE"].atom_type += "/+1"
-                        residue["NH1"].atom_type += "/+1"
-                        residue["NH2"].atom_type += "/+1"
-                        residue["HH11"].atom_type += "/+1"
-                        residue["HH12"].atom_type += "/+1"
-                        residue["HH21"].atom_type += "/+1"
-                        residue["HH22"].atom_type += "/+1"
-
-                if residue.resname == "HIS" and atom.name == "CE1":
-                    near_HH = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
-                                  residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
-                    if len(near_HH) == 2:
-                        atom.atom_type += "/+1"
-                        residue["CD2"].atom_type += "/+1"
-                        residue["ND1"].atom_type += "/+1"
-                        residue["NE2"].atom_type += "/+1"
-                        try:
-                            residue["HE2"].atom_type += "/+1"
-                        except KeyError:
-                            pass
-                        try:
-                            residue["HD1"].atom_type += "/+1"
-                        except KeyError:
-                            pass
+        print("ok\n")
 
     def _get_ancestors(self, atom):
         a2, a3, a4 = atomic_types[atom.get_parent().resname][atom.atom_type.split("/")[0]]["ancestors"]
@@ -370,27 +359,8 @@ class Protein:
 
     def get_lenghts_angles(self):
 
-
-
-
-
         for res_i, residue in enumerate(self.residues):
-            # if residue.get_resname() == "TRP":
-            #
-            #     dostupne_uhly = residue.internal_coord.hedra.keys()
-            #     for k in dostupne_uhly:
-            #         nazvy_atomu = [atom_key.id.split("_")[-1] for atom_key in k]
-            #         print(":".join(nazvy_atomu))
-            #     #
-            #     print("\n")
-            #     dostupne_uhly = residue.internal_coord.dihedra.keys()
-            #     for k in dostupne_uhly:
-            #         nazvy_atomu = [atom_key.id.split("_")[-1] for atom_key in k]
-            #         print(":".join(nazvy_atomu))
-            #
-            #     # print(dir(residue.internal_coord))
-            #     # print(residue.internal_coord.dihedra)
-            #     exit()
+
             res_name = residue.resname
             for atom in residue.get_atoms():
                 atom_type = getattr(atom, "atom_type", False)
