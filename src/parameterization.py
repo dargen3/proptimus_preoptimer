@@ -1,86 +1,103 @@
 import json
 import numpy as np
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 
-from src.protein import Protein
-from src.data import atomic_types
+from .protein import Protein
+from .data import atomic_types
+
+MIN_SAMPLES = 100  # minimal number of values of an atom type needed for its parameterization
+
+
+def _extract_protein(pdb_file):
+    """Measure one protein; returns plain tuples, so the result can be sent from a worker process."""
+    protein = Protein(pdb_file, output=False)
+    return [(f"{pdb_file},{m.res_name}{m.res_id},{m.atom_name}", m) for m in protein.get_lengths_angles()]
+
+
+def _run_kmeans(values, num_clusters, angular_data=False):
+    if angular_data:  # dihedral angles: clustering on the unit circle
+        radians = np.deg2rad(values)
+        data = np.column_stack((np.cos(radians), np.sin(radians)))
+        kmeans = KMeans(n_clusters=num_clusters, init='k-means++', n_init=10, random_state=42)
+        kmeans.fit(data)
+        return [float(np.rad2deg(np.arctan2(y, x))) for x, y in kmeans.cluster_centers_]
+
+    # 1D data, bond lengths and angles
+    data = np.array(values, dtype=float).reshape(-1, 1)
+    kmeans = KMeans(n_clusters=num_clusters, init='k-means++', n_init='auto', random_state=42)
+    kmeans.fit(data)
+    return kmeans.cluster_centers_.flatten().tolist()
+
+
+def _calculate_atom_type(job):
+    """Parameters of one atom type; a top-level function so it can run in a worker process."""
+    residue_name, at_type, at_type_values = job
+    bond_length_n_clusters, bond_angle_n_clusters, dihedral_angle_n_clusters = \
+        atomic_types[residue_name][at_type.split("/")[0]]["n_clusters"]
+    result = {}
+    if bond_length_n_clusters:
+        result["bond_length"] = _run_kmeans(at_type_values["bond_length"], bond_length_n_clusters)
+    if bond_angle_n_clusters:
+        result["bond_angle"] = _run_kmeans(at_type_values["bond_angle"], bond_angle_n_clusters)
+    if dihedral_angle_n_clusters:
+        result["dihedral_angle"] = _run_kmeans(at_type_values["dihedral_angle"], dihedral_angle_n_clusters,
+                                               angular_data=True)
+    return residue_name, at_type, result
 
 
 class Parameterization:
-    def __init__(self, structures_dir, parameters_file):
+    def __init__(self, structures_dir, parameters_file, workers=None):
         self.structures_dir = Path(structures_dir)
         self.parameters_file = parameters_file
-
-        # Extracting structural data
-        preprocessed_data_json = self.structures_dir / Path("bond_lengths_angles.json")
-        pdb_files = sorted(self.structures_dir.glob("*.pdb"))[:5]
+        self.workers = workers  # None = number of CPUs
         self.data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        for pdb_file in tqdm(pdb_files, desc="Extracting structural data", unit="protein"):
-            protein = Protein(pdb_file, output=False)
-            protein.get_lenghts_angles()
-            for residue in protein.residues:
-                res_name = residue.resname
-                res_id = residue.id[1]
-                for atom in residue.get_atoms():
-                    atom_type = getattr(atom, "atom_type", False)
-                    if atom_type:
-                        ID = f"{protein.pdb_file},{res_name}{res_id},{atom.name}"
-                        atom_type_data = self.data[res_name][atom_type]
-                        atom_type_data["ID"].append(ID)
-                        atom_type_data["bond_length"].append(atom.bond_length)
-                        atom_type_data["bond_angle"].append(atom.bond_angle)
-                        atom_type_data["dihedral_angle"].append(atom.dihedral_angle)
-        with open(preprocessed_data_json, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=4)
-
-        # Calculate parameters
         self.parameters = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        total = sum(len(at_types) for at_types in self.data.values())
-        with tqdm(total=total, desc="Calculating parameters", unit="atom type") as progress:
-            for residue_name, residue_at_types in self.data.items():
-                for at_type, at_type_values in residue_at_types.items():
-                    progress.set_postfix_str(f"{residue_name} {at_type}")
-                    bond_length_n_clusters, bond_angle_n_clusters, dihedral_angle_n_clusters = atomic_types[residue_name][at_type.split("/")[0]]["n_clusters"]
-                    if bond_length_n_clusters:
-                        self.parameters[residue_name][at_type]["bond_length"] = self._run_kmeans(at_type_values["bond_length"], bond_length_n_clusters)
-                    if bond_angle_n_clusters:
-                        self.parameters[residue_name][at_type]["bond_angle"] = self._run_kmeans(at_type_values["bond_angle"], bond_angle_n_clusters)
-                    if dihedral_angle_n_clusters:
-                        self.parameters[residue_name][at_type]["dihedral_angle"] = self._run_kmeans(at_type_values["dihedral_angle"], dihedral_angle_n_clusters, angular_data=True)
-                    progress.update()
 
-        # Saving parameters
+    def run(self):
+        self.extract_data()
+        self.check_sample_sizes()
+        self.calculate_parameters()
+        self.save_parameters()
+
+    def extract_data(self):
+        """Measure bond lengths, bond angles and dihedral angles of all proteins in the directory."""
+        pdb_files = sorted(self.structures_dir.glob("*.pdb"))
+        with ProcessPoolExecutor(max_workers=self.workers) as executor:
+            for protein_data in tqdm(executor.map(_extract_protein, pdb_files), total=len(pdb_files),
+                                     desc="Extracting structural data", unit="protein"):
+                for atom_id, m in protein_data:
+                    atom_type_data = self.data[m.res_name][m.atom_type]
+                    atom_type_data["ID"].append(atom_id)
+                    atom_type_data["bond_length"].append(m.bond_length)
+                    atom_type_data["bond_angle"].append(m.bond_angle)
+                    atom_type_data["dihedral_angle"].append(m.dihedral_angle)
+
+    def check_sample_sizes(self, min_samples=MIN_SAMPLES):
+        """Terminate the program if any atom type has fewer than min_samples values."""
+        too_small = [f"{residue_name} {at_type}: {len(values['ID'])}"
+                     for residue_name, residue_at_types in self.data.items()
+                     for at_type, values in residue_at_types.items() if len(values["ID"]) < min_samples]
+        if too_small:
+            raise SystemExit(f"\nError: fewer than {min_samples} values for these atom types, "
+                             "use more proteins:\n    " + "\n    ".join(too_small))
+
+    def calculate_parameters(self):
+        """Cluster the measured values of every atom type."""
+        jobs = [(residue_name, at_type, at_type_values)
+                for residue_name, residue_at_types in self.data.items()
+                for at_type, at_type_values in residue_at_types.items()]
+        with ProcessPoolExecutor(max_workers=self.workers) as executor:
+            for residue_name, at_type, result in tqdm(executor.map(_calculate_atom_type, jobs), total=len(jobs),
+                                                      desc="Calculating parameters", unit="atom type"):
+                self.parameters[residue_name][at_type].update(result)
+
+    def save_parameters(self):
         with open(self.parameters_file, "w", encoding="utf-8") as f:
             json.dump(self.parameters, f, ensure_ascii=False, indent=4)
-
-
-    @staticmethod
-    def _run_kmeans(values, num_clusters, angular_data=False):
-        # dihedral angles
-        if angular_data:
-            radians = np.deg2rad(values)
-            x = np.cos(radians)
-            y = np.sin(radians)
-            data = np.column_stack((x, y))
-            kmeans_instance = KMeans(n_clusters=num_clusters, init='k-means++', n_init=1)
-            kmeans_instance.fit(data)
-            centers_2d = kmeans_instance.cluster_centers_
-            centers_deg = []
-            for center in centers_2d:
-                angle_rad = np.arctan2(center[1], center[0])
-                centers_deg.append(np.rad2deg(angle_rad))
-            return centers_deg
-
-        # 1D data, bond lengths and angles
-        else:
-            data = np.array(values, dtype=float).reshape(-1, 1)
-            kmeans = KMeans(n_clusters=num_clusters, init='k-means++', n_init='auto', random_state=42)
-            kmeans.fit(data)
-            return kmeans.cluster_centers_.flatten().tolist()
-
 
     def find_outliers(self, gap_factor=0.5):
         print("\n\nOUTLIERS ANALYSIS:")

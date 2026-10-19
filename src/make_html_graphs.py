@@ -150,9 +150,9 @@ def _add_polar_histogram(fig: go.Figure, angles: list, ids: list, targets: list)
         )
 
 
-def _format_figure(fig: go.Figure, res_name: str, at_name: str) -> None:
+def _format_figure(fig: go.Figure, res_name: str, at_name: str, n_atoms: int) -> None:
     fig.update_layout(
-        title_text=f"Residue: {res_name}; Atom type: {at_name}",
+        title_text=f"Residue: {res_name}; Atom type: {at_name} (n={n_atoms})",
         title_x=0.5,
         title_font_size=20,
         showlegend=False,
@@ -189,16 +189,8 @@ def _create_figure_for_atom(data: dict, parameters: dict, res_name: str, at_name
     _add_histogram_and_rug(fig, atom_data["bond_angle"], ids, atom_params.get("bond_angle", []),
                            col=2, title="Bond Angle", unit="°")
     _add_polar_histogram(fig, atom_data["dihedral_angle"], ids, atom_params.get("dihedral_angle", []))
-    _format_figure(fig, res_name, at_name)
+    _format_figure(fig, res_name, at_name, len(ids))
     return fig
-
-
-def create_graph(data: dict, parameters: dict, res_name: str, at_name: str) -> None:
-    """
-    Shows a Plotly figure with subplots for Bond Lengths, Bond Angles,
-    and Dihedral Angles.
-    """
-    _create_figure_for_atom(data, parameters, res_name, at_name).show()
 
 
 def _file_name(res_name: str, at_name: str) -> str:
@@ -221,10 +213,10 @@ def _write_index(index_file: Path, files: dict) -> None:
     )
 
 
-def make_html_graphs(data: dict, parameters: dict, output_dir: str) -> None:
+def make_html_graphs(data: dict, parameters: dict, output_dir: str, open_browser: bool = False) -> None:
     """
     Saves one HTML graph per atom type of every residue to output_dir, together with
-    index.html linking to all of them, and opens the index in the default browser.
+    index.html linking to all of them. The index is opened in the default browser if open_browser is set.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -243,4 +235,5 @@ def make_html_graphs(data: dict, parameters: dict, output_dir: str) -> None:
                 progress.update()
     index_file = out / "index.html"
     _write_index(index_file, files)
-    webbrowser.open(index_file.resolve().as_uri())
+    if open_browser:
+        webbrowser.open(index_file.resolve().as_uri())

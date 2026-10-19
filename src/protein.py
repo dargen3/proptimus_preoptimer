@@ -1,171 +1,160 @@
-import numpy as np
-import warnings
-from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors # vectors.calc_dihedral
-from .data import unprocessed_atoms, atomic_types, at_types_lookup
 import json
+import warnings
+from collections import namedtuple
+from contextlib import contextmanager
+from functools import cached_property, lru_cache
+
+import numpy as np
+from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors  # vectors.calc_dihedral
+
+from .data import unprocessed_atoms, atomic_types, at_types_lookup
+
+# Atom type suffixes are appended to the atom type: "<type>/<tautomer or charge>", e.g. "CE1/HID", "NZ/+1".
+# A rule is applied when all (protonated=True) or none (protonated=False) of the given hydrogens are present
+# in the residue; the suffix is then added to the types of all listed atoms.
+ChargeRule = namedtuple("ChargeRule", "resname trigger hydrogens protonated suffix atoms")
+CHARGE_RULES = [
+    ChargeRule("LYS", "NZ", ("HZ1", "HZ2", "HZ3"), True, "+1", ("NZ", "HZ1", "HZ2", "HZ3")),
+    ChargeRule("ASP", "OD2", ("HD2",), False, "-1", ("OD2", "OD1", "CG")),
+    ChargeRule("GLU", "OE2", ("HE2",), False, "-1", ("OE2", "OE1", "CD")),
+    ChargeRule("CYS", "SG", ("HG",), False, "-1", ("SG",)),
+    ChargeRule("TYR", "OH", ("HH",), False, "-1", ("OH", "CZ", "CE1", "CE2", "CD1", "CD2")),
+    ChargeRule("ARG", "CZ", ("HE", "HH11", "HH12", "HH21", "HH22"), True, "+1",
+               ("CZ", "NE", "HE", "NH1", "NH2", "HH11", "HH12", "HH21", "HH22")),
+    ChargeRule("HIS", "CE1", ("HD1", "HE2"), True, "+1", ("CE1", "CD2", "ND1", "NE2", "HD1", "HE2")),
+]
+HISTIDINE_RING = ("CE1", "CD2", "ND1", "NE2")
+SS_BRIDGE_DISTANCE = 2.2  # Å
+
+# One row of the measured geometry of an atom, see Protein.get_lengths_angles
+Measurement = namedtuple("Measurement", "res_name res_id atom_name atom_type bond_length bond_angle dihedral_angle")
 
 
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    message=".*'where' used without 'out'.*"
-)
+@contextmanager
+def _quiet_biopython():
+    """Suppress the numpy warning raised inside Biopython's internal coordinates."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, message=".*'where' used without 'out'.*")
+        yield
+
+
+@lru_cache(maxsize=None)
+def _ancestors_with_offsets(res_name, base_atom_type, atom_name):
+    """Ancestor atom names and residue offsets (0 = same residue, +1 = next, -1 = previous)."""
+    names, offsets = [], []
+    for ancestor in atomic_types[res_name][base_atom_type]["ancestors"]:
+        name, _, offset = ancestor.partition("/")
+        names.append(name.replace("x", atom_name[2]) if "x" in name else name)
+        offsets.append(int(offset) if offset else 0)
+    return tuple(names), tuple(offsets)
 
 
 class Protein:
-    def __init__(self,
-                 pdb_file, output=True):
+    def __init__(self, pdb_file, output=True):
         if output:
             print(f"Loading protein from {pdb_file}...", end="")
         self.pdb_file = pdb_file
-        self.original_structure = PDBParser(QUIET=True).get_structure(id="structure", file=pdb_file)
         self.structure = PDBParser(QUIET=True).get_structure(id="structure", file=pdb_file)
-        self.structure.atom_to_internal_coordinates()
+        with _quiet_biopython():
+            self.structure.atom_to_internal_coordinates()
         self.residues = list(self.structure.get_residues())
 
         # assign atomic types
-        self.kdtree = NeighborSearch(list(self.structure.get_atoms()))
+        self.atom_types = {}  # atom -> atom type, only for atoms which are processed
         self._assign_basic_atomic_types()
         self._assign_histidine_types()
         self._assign_formal_charges()
         if output:
             print(" ok")
 
+    @cached_property
+    def original_structure(self):
+        """Structure as loaded from the file; parsed only when needed (preoptimization)."""
+        return PDBParser(QUIET=True).get_structure(id="structure", file=self.pdb_file)
+
+    # ---------------------------------------------------------------- atom types
     def _assign_basic_atomic_types(self):
-        for residue_i, residue in enumerate(self.residues):
+        sg_atoms = [atom for residue in self.residues if residue.resname == "CYS"
+                    for atom in residue.get_atoms() if atom.name == "SG"]
+        sg_search = NeighborSearch(sg_atoms) if sg_atoms else None
+        first_residue, last_residue = self.residues[0], self.residues[-1]
+
+        for residue in self.residues:
+            res_types = at_types_lookup.get(residue.resname, {})
             for atom in residue.get_atoms():
                 if atom.name in unprocessed_atoms:
                     continue
                 if residue.resname == "CYS" and atom.name == "SG":  # skip -SS- bridges
-                    near_SG = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2.2, level="A")
-                               if near_atom.name == "SG"]
-                    if len(near_SG) == 2:
+                    if len(sg_search.search(center=atom.coord, radius=SS_BRIDGE_DISTANCE, level="A")) == 2:
                         continue
-                if atom.name == "H" and residue_i == 0:
+                if residue is first_residue and atom.name in ("H", "N"):
                     continue
-                if atom.name == "O" and residue is self.residues[-1]:
+                if residue is last_residue and atom.name in ("O", "C"):
                     continue
-                if atom.name == "C" and residue is self.residues[-1]:
-                    continue
-                if atom.name == "N" and residue_i == 0:
-                    continue
-                atom.atom_type = at_types_lookup[residue.resname][atom.name]
+                atom_type = res_types.get(atom.name)
+                if atom_type:
+                    self.atom_types[atom] = atom_type
+
+    def _add_suffix(self, residue, atom_names, suffix):
+        for name in atom_names:
+            if name in residue and residue[name] in self.atom_types:
+                self.atom_types[residue[name]] += "/" + suffix
 
     def _assign_histidine_types(self):
         for residue in self.residues:
-            for atom in residue.get_atoms():
-                if not getattr(atom, "atom_type", False):
-                    continue
-                if residue.resname == "HIS" and atom.name == "CE1":
-                    near_HH = [near_atom.name for near_atom in
-                               self.kdtree.search(center=atom.coord, radius=4, level="A") if
-                               residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
-                    if near_HH == ["HD1"]:
-                        atom.atom_type += "/HID"
-                        residue["CD2"].atom_type += "/HID"
-                        residue["ND1"].atom_type += "/HID"
-                        residue["NE2"].atom_type += "/HID"
-                        residue["HD1"].atom_type += "/HID"
-                    elif near_HH == ["HE2"]:
-                        atom.atom_type += "/HIE"
-                        residue["CD2"].atom_type += "/HIE"
-                        residue["ND1"].atom_type += "/HIE"
-                        residue["NE2"].atom_type += "/HIE"
-                        residue["HE2"].atom_type += "/HIE"
+            if residue.resname != "HIS" or "CE1" not in residue or residue["CE1"] not in self.atom_types:
+                continue
+            protonated = [h for h in ("HD1", "HE2") if h in residue]
+            if len(protonated) == 1:  # exactly one of the two hydrogens: HID or HIE
+                self._add_suffix(residue, HISTIDINE_RING + (protonated[0],), "HI" + protonated[0][1])
 
     def _assign_formal_charges(self):
         for residue in self.residues:
-            for atom in residue.get_atoms():
-                if not getattr(atom, "atom_type", False):
+            for rule in CHARGE_RULES:
+                if residue.resname != rule.resname or rule.trigger not in residue \
+                        or residue[rule.trigger] not in self.atom_types:
                     continue
+                present = [h in residue for h in rule.hydrogens]
+                if all(present) if rule.protonated else not any(present):
+                    self._add_suffix(residue, rule.atoms, rule.suffix)
 
-                if residue.resname == "LYS" and atom.name == "NZ":
-                    near_HZ = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                               residue == near_atom.get_parent() and near_atom.name[:2] == "HZ"]
-                    if len(near_HZ) == 3:
-                        atom.atom_type += "/+1"
-                        for atom in near_HZ:
-                            atom.atom_type += "/+1"
+    # ---------------------------------------------------------------- ancestors
+    def _base_type(self, atom):
+        return self.atom_types[atom].split("/")[0]
 
-                if residue.resname == "ASP" and atom.name == "OD2":
-                    near_HD2 = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                residue == near_atom.get_parent() and near_atom.name == "HD2"]
-                    if len(near_HD2) == 0:
-                        atom.atom_type += "/-1"
-                        residue["OD1"].atom_type += "/-1"
-                        residue["CG"].atom_type += "/-1"
+    def _type_data(self, atom):
+        return atomic_types[atom.get_parent().resname][self._base_type(atom)]
 
-                if residue.resname == "GLU" and atom.name == "OE2":
-                    near_HE2 = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                                residue == near_atom.get_parent() and near_atom.name == "HE2"]
-                    if len(near_HE2) == 0:
-                        atom.atom_type += "/-1"
-                        residue["OE1"].atom_type += "/-1"
-                        residue["CD"].atom_type += "/-1"
+    def _get_ancestors_with_offsets(self, atom):
+        return _ancestors_with_offsets(atom.get_parent().resname, self._base_type(atom), atom.name)
 
-                if residue.resname == "CYS" and atom.name == "SG":
-                    near_HG = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                               residue == near_atom.get_parent() and near_atom.name == "HG"]
-                    if len(near_HG) == 0:
-                        atom.atom_type += "/-1"
+    def _get_ancestors(self, atom):
+        """Ancestor atom names without residue offsets."""
+        return self._get_ancestors_with_offsets(atom)[0]
 
-                if residue.resname == "TYR" and atom.name == "OH":  # možná pořešit i aromatický cyklus?
-                    near_HH = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=2, level="A") if
-                               residue == near_atom.get_parent() and near_atom.name == "HH"]
-                    if len(near_HH) == 0:
-                        atom.atom_type += "/-1"
-                        residue["CZ"].atom_type += "/-1"
-                        residue["CE1"].atom_type += "/-1"
-                        residue["CE2"].atom_type += "/-1"
-                        residue["CD1"].atom_type += "/-1"
-                        residue["CD2"].atom_type += "/-1"
+    def _has_neighbor_ancestors(self, atom):
+        return any(self._get_ancestors_with_offsets(atom)[1])
 
-                if residue.resname == "ARG" and atom.name == "CZ":
-                    near_H = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
-                              residue == near_atom.get_parent() and near_atom.name in ["HE", "HH11", "HH12", "HH21",
-                                                                                       "HH22"]]
-                    if len(near_H) == 5:
-                        atom.atom_type += "/+1"
-                        residue["NE"].atom_type += "/+1"
-                        residue["HE"].atom_type += "/+1"
-                        residue["NH1"].atom_type += "/+1"
-                        residue["NH2"].atom_type += "/+1"
-                        residue["HH11"].atom_type += "/+1"
-                        residue["HH12"].atom_type += "/+1"
-                        residue["HH21"].atom_type += "/+1"
-                        residue["HH22"].atom_type += "/+1"
+    def _get_ancestor_atoms(self, res_i, atom):
+        """Ancestor atoms, taken from the previous / next residue where the offset says so."""
+        names, offsets = self._get_ancestors_with_offsets(atom)
+        return [self.residues[res_i + offset][name] for name, offset in zip(names, offsets)]
 
-                if residue.resname == "HIS" and atom.name == "CE1":
-                    near_HH = [near_atom for near_atom in self.kdtree.search(center=atom.coord, radius=4, level="A") if
-                               residue == near_atom.get_parent() and near_atom.name in ["HD1", "HE2"]]
-                    if len(near_HH) == 2:
-                        atom.atom_type += "/+1"
-                        residue["CD2"].atom_type += "/+1"
-                        residue["ND1"].atom_type += "/+1"
-                        residue["NE2"].atom_type += "/+1"
-                        try:
-                            residue["HE2"].atom_type += "/+1"
-                        except KeyError:
-                            pass
-                        try:
-                            residue["HD1"].atom_type += "/+1"
-                        except KeyError:
-                            pass
-
-
-
-
+    # ---------------------------------------------------------------- preoptimization
     def preoptimize(self, parameters_file):
         print("Setting bond lengths, bond angles and dihedral angles... ", end="")
         with open(parameters_file, "r", encoding="utf-8") as f:
             parameters = json.load(f)
 
         self._set_internal_coordinates(parameters)
-        self.structure.internal_to_atom_coordinates()
+        with _quiet_biopython():
+            self.structure.internal_to_atom_coordinates()
         self._superimpose_on_original()
 
         self._place_single_bonded_atoms(parameters)
-        # C and N depend on CA and on the neighbouring residue; O and H depend on the already placed C and N
+        # C and N depend on CA and on the neighbouring residue; O and H depend on the already placed C and N.
+        # The atoms are placed residue by residue, so C(i) uses the not yet placed N(i+1), while N(i) uses
+        # the already placed C(i-1). The result is therefore slightly asymmetric.
         self._place_atoms_with_neighbor_ancestors(parameters, ["C", "N"])
         self._place_atoms_with_neighbor_ancestors(parameters, ["O", "H"])
         print("ok")
@@ -174,8 +163,8 @@ class Protein:
         """Yield (residue index, residue, atom, atom parameters) for all atoms with an atom type."""
         for res_i, residue in enumerate(self.residues):
             for atom in residue.get_atoms():
-                if getattr(atom, "atom_type", False):
-                    yield res_i, residue, atom, parameters[residue.resname][atom.atom_type]
+                if atom in self.atom_types:
+                    yield res_i, residue, atom, parameters[residue.resname][self.atom_types[atom]]
 
     def _set_internal_coordinates(self, parameters):
         """Set bond lengths, bond angles and dihedral angles of atoms whose ancestors are all in their own residue."""
@@ -184,7 +173,7 @@ class Protein:
                 continue
 
             a2, a3, a4 = self._get_ancestors(atom)
-            atom_type_data = atomic_types[residue.resname][atom.atom_type.split("/")[0]]
+            atom_type_data = self._type_data(atom)
             internal_coord = residue.internal_coord
 
             # bond length
@@ -214,17 +203,20 @@ class Protein:
 
     def _superimpose_on_original(self):
         """Superimpose the structure with the new coordinates on the original one using CA atoms."""
+        def alpha_carbons(structure):
+            return [atom for atom in structure.get_atoms() if atom.element == "C" and atom.name == "CA"]
+
         sup = Superimposer()
-        sup.set_atoms([atom for atom in self.original_structure.get_atoms() if atom.name == "CA"],
-                      [atom for atom in self.structure.get_atoms() if atom.name == "CA"])
-        sup.apply(self.structure)
+        sup.set_atoms(alpha_carbons(self.original_structure), alpha_carbons(self.structure))
+        with _quiet_biopython():
+            sup.apply(self.structure)
 
     def _place_single_bonded_atoms(self, parameters):
         """Place custom atoms (atoms with a single chemical bond) using the closest cluster center of the dihedral."""
         for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
             if "dihedral_angle" not in atom_parameters or self._has_neighbor_ancestors(atom):
                 continue
-            if "ancestors_type" not in atomic_types[residue.resname][atom.atom_type.split("/")[0]]:
+            if "ancestors_type" not in self._type_data(atom):
                 continue
 
             A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
@@ -250,6 +242,7 @@ class Protein:
                                                      atom_parameters["bond_angle"][0],
                                                      dihedral_angle)
 
+    # ---------------------------------------------------------------- geometry
     @staticmethod
     def _dihedral(atom, a2, a3, a4):
         """Dihedral angle atom-a2-a3-a4 in degrees."""
@@ -299,7 +292,6 @@ class Protein:
         # back to the global space
         return a1 + x * e1 + y * e2 + z * e3
 
-
     def save(self, output_PDB_file):
         print(f"Saving preoptimized protein to {output_PDB_file}... ", end="")
         io = PDBIO()
@@ -307,59 +299,35 @@ class Protein:
         io.save(output_PDB_file)
         print("ok\n")
 
-    def _get_ancestors_with_offsets(self, atom):
-        """Ancestor atom names and residue offsets (0 = same residue, +1 = next, -1 = previous)."""
-        names, offsets = [], []
-        for ancestor in atomic_types[atom.get_parent().resname][atom.atom_type.split("/")[0]]["ancestors"]:
-            name, _, offset = ancestor.partition("/")
-            names.append(name.replace("x", atom.name[2]) if "x" in name else name)
-            offsets.append(int(offset) if offset else 0)
-        return names, offsets
-
-    def _get_ancestors(self, atom):
-        """Ancestor atom names without residue offsets."""
-        a2, a3, a4 = self._get_ancestors_with_offsets(atom)[0]
-        return a2, a3, a4
-
-    def _has_neighbor_ancestors(self, atom):
-        return any(self._get_ancestors_with_offsets(atom)[1])
-
-    def _get_ancestor_atoms(self, res_i, atom):
-        """Ancestor atoms, taken from the previous / next residue where the offset says so."""
-        names, offsets = self._get_ancestors_with_offsets(atom)
-        return [self.residues[res_i + offset][name] for name, offset in zip(names, offsets)]
-
-
-    def get_lenghts_angles(self):
-
+    # ---------------------------------------------------------------- measurement
+    def get_lengths_angles(self):
+        """Return a Measurement (bond length, bond angle, dihedral angle) for every atom with an atom type."""
+        measurements = []
         for res_i, residue in enumerate(self.residues):
+            for atom, atom_type in ((atom, self.atom_types.get(atom)) for atom in residue.get_atoms()):
+                if not atom_type:
+                    continue
+                a2, a3, a4 = self._get_ancestors(atom)
+                A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
+                atom_type_data = self._type_data(atom)
+                internal_coord = residue.internal_coord
 
-            res_name = residue.resname
-            for atom in residue.get_atoms():
-                atom_type = getattr(atom, "atom_type", False)
-                if atom_type:
+                bond_length = internal_coord.get_length(f"{atom.name}:{a2}")
 
+                if A3.get_parent() is not residue:
+                    bond_angle = np.degrees(vectors.calc_angle(atom.get_vector(), A2.get_vector(), A3.get_vector()))
+                elif atom_type_data.get("reverse order", False):
+                    bond_angle = internal_coord.get_angle(f"{atom.name}:{a2}:{a3}")
+                else:
+                    bond_angle = internal_coord.get_angle(f"{a3}:{a2}:{atom.name}")
 
-                    a2, a3, a4 = self._get_ancestors(atom)
-                    A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
-                    atom_type_data = atomic_types[res_name][atom_type.split("/")[0]]
+                # internal coordinates are used only when all ancestors are in the same residue
+                # (custom atoms and CB are computed from vectors)
+                if "ancestors_type" in atom_type_data or atom.name == "CB" or self._has_neighbor_ancestors(atom):
+                    dihedral_angle = self._dihedral(atom, A2, A3, A4)
+                else:
+                    dihedral_angle = internal_coord.get_angle(f"{a4}:{a3}:{a2}:{atom.name}")
 
-                    # bond length
-                    atom.bond_length = residue.internal_coord.get_length(f"{atom.name}:{a2}")
-
-                    # bond angle
-                    if A3.get_parent() is not residue:
-                        atom.bond_angle = np.degrees(vectors.calc_angle(atom.get_vector(), A2.get_vector(), A3.get_vector()))
-                    elif atom_type_data.get("reverse order", False):
-                        atom.bond_angle = residue.internal_coord.get_angle(f"{atom.name}:{a2}:{a3}")
-                    else:
-                        atom.bond_angle = residue.internal_coord.get_angle(f"{a3}:{a2}:{atom.name}")
-
-                    # dihedral angle
-                    # internal coordinates are used only when all ancestors are in the same residue
-                    # (custom atoms and CB are computed from vectors)
-                    if "ancestors_type" in atom_type_data or atom.name == "CB" or self._has_neighbor_ancestors(atom):
-                        atom.dihedral_angle = np.degrees(vectors.calc_dihedral(atom.get_vector(), A2.get_vector(), A3.get_vector(), A4.get_vector()))
-                    else:
-                        atom.dihedral_angle = residue.internal_coord.get_angle(f"{a4}:{a3}:{a2}:{atom.name}")
-
+                measurements.append(Measurement(residue.resname, residue.id[1], atom.name, atom_type,
+                                                bond_length, bond_angle, dihedral_angle))
+        return measurements

@@ -46,6 +46,13 @@ def load_arguments():
                               help='Directory to store the results.'
                                    'The calculated parameters are saved to parameters.json and HTML graphs of all '
                                    'atom types of all residues to the "graphs" subdirectory.')
+    parameterize.add_argument('--workers',
+                              type=int,
+                              metavar='N',
+                              help='Number of worker processes (default: number of CPUs).')
+    parameterize.add_argument('--open_browser',
+                              action='store_true',
+                              help='Open the HTML graphs in the default web browser when they are ready.')
     args = parser.parse_args()
     if args.mode == 'preoptimize':
         missing = [a for a in ('input_PDB_file', 'output_PDB_file', 'parameters') if getattr(args, a) is None]
@@ -78,8 +85,11 @@ def main():
     elif args.mode == 'parameterize':
         data_dir = Path(args.data_dir)
         data_dir.mkdir(parents=True)
-        parameterization = Parameterization(args.proteins_directory, str(data_dir / 'parameters.json'))
-        make_html_graphs(parameterization.data, parameterization.parameters, str(data_dir / 'graphs'))
+        parameterization = Parameterization(args.proteins_directory, str(data_dir / 'parameters.json'),
+                                            workers=args.workers)
+        parameterization.run()
+        make_html_graphs(parameterization.data, parameterization.parameters, str(data_dir / 'graphs'),
+                         open_browser=args.open_browser)
         parameterization.find_outliers()
 
 
