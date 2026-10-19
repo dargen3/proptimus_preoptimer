@@ -8,13 +8,24 @@ import plotly.graph_objects as go
 from tqdm import tqdm
 from plotly.subplots import make_subplots
 
+from .data import atomic_types
+
 COLOR = "#636EFA"
 TARGET_COLOR = "red"
 HISTOGRAM_BINS = 30
 POLAR_BINS = 120
 
 
-def _create_figure() -> go.Figure:
+def _subplot_titles(res_name: str, at_name: str) -> tuple:
+    """Titles stating which atoms the bond length, bond angle and dihedral angle are measured between."""
+    a1 = at_name.split("/")[0]
+    a2, a3, a4 = atomic_types[res_name][a1]["ancestors"]
+    return (f"Bond Lengths ({a1}-{a2})",
+            f"Bond Angles ({a1}-{a2}-{a3})",
+            f"Dihedral Angles ({a1}-{a2}-{a3}-{a4})")
+
+
+def _create_figure(res_name: str, at_name: str) -> go.Figure:
     fig = make_subplots(
         rows=2,
         cols=3,
@@ -22,7 +33,7 @@ def _create_figure() -> go.Figure:
         row_heights=[0.95, 0.05],
         vertical_spacing=0.03,
         horizontal_spacing=0.06,
-        subplot_titles=("Bond Lengths", "Bond Angles", "Dihedral Angles"),
+        subplot_titles=_subplot_titles(res_name, at_name),
         specs=[
             [{"type": "xy"}, {"type": "xy"}, {"type": "polar", "rowspan": 2}],
             [{"type": "xy"}, {"type": "xy"}, None],
@@ -141,7 +152,7 @@ def _add_polar_histogram(fig: go.Figure, angles: list, ids: list, targets: list)
 
 def _format_figure(fig: go.Figure, res_name: str, at_name: str) -> None:
     fig.update_layout(
-        title_text=f"Analysis of bond lengths and angles for atom {res_name} {at_name}",
+        title_text=f"Residue: {res_name}; Atom type: {at_name}",
         title_x=0.5,
         title_font_size=20,
         showlegend=False,
@@ -172,7 +183,7 @@ def _create_figure_for_atom(data: dict, parameters: dict, res_name: str, at_name
     atom_params = parameters[res_name][at_name]
     ids = atom_data["ID"]
 
-    fig = _create_figure()
+    fig = _create_figure(res_name, at_name)
     _add_histogram_and_rug(fig, atom_data["bond_length"], ids, atom_params.get("bond_length", []),
                            col=1, title="Bond Length", unit="Å")
     _add_histogram_and_rug(fig, atom_data["bond_angle"], ids, atom_params.get("bond_angle", []),
