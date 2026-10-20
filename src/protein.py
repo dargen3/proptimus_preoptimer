@@ -141,22 +141,23 @@ class Protein:
         return [self.residues[res_i + offset][name] for name, offset in zip(names, offsets)]
 
     # ---------------------------------------------------------------- preoptimization
-    def preoptimize(self, parameters_file):
-        print("Setting bond lengths, bond angles and dihedral angles... ", end="")
+    def preoptimize(self, parameters_file, only_hydrogens=False):
+        print("Setting bond lengths, bond angles and dihedral angles of hydrogens... ", end="")
         with open(parameters_file, "r", encoding="utf-8") as f:
             parameters = json.load(f)
-
-        self._set_internal_coordinates(parameters)
-        with _quiet_biopython():
-            self.structure.internal_to_atom_coordinates()
-        self._superimpose_on_original()
-
-        self._place_single_bonded_atoms(parameters)
-        # C and N depend on CA and on the neighbouring residue; O and H depend on the already placed C and N.
-        # The atoms are placed residue by residue, so C(i) uses the not yet placed N(i+1), while N(i) uses
-        # the already placed C(i-1). The result is therefore slightly asymmetric.
-        self._place_atoms_with_neighbor_ancestors(parameters, ["C", "N"])
-        self._place_atoms_with_neighbor_ancestors(parameters, ["O", "H"])
+        if only_hydrogens:
+            self._place_hydrogens(parameters)
+        else:
+            self._set_internal_coordinates(parameters)
+            with _quiet_biopython():
+                self.structure.internal_to_atom_coordinates()
+            self._superimpose_on_original()
+            self._place_single_bonded_atoms(parameters)
+            # C and N depend on CA and on the neighbouring residue; O and H depend on the already placed C and N.
+            # The atoms are placed residue by residue, so C(i) uses the not yet placed N(i+1), while N(i) uses
+            # the already placed C(i-1). The result is therefore slightly asymmetric.
+            self._place_atoms_with_neighbor_ancestors(parameters, ["C", "N"])
+            self._place_atoms_with_neighbor_ancestors(parameters, ["O", "H"])
         print("ok")
 
     def _iter_typed_atoms(self, parameters):
@@ -237,6 +238,23 @@ class Protein:
                 dihedral_angle = atom_parameters["dihedral_angle"][0]  # taken directly from the parameters
             else:
                 dihedral_angle = self._dihedral(atom, A2, A3, A4)  # kept from the current geometry
+            atom.coord = self._compute_atom_position(A2.coord, A3.coord, A4.coord,
+                                                     atom_parameters["bond_length"][0],
+                                                     atom_parameters["bond_angle"][0],
+                                                     dihedral_angle)
+
+    def _place_hydrogens(self, parameters):
+        """Place only hydrogens, heavy atoms are kept at their original positions. The ancestors of hydrogens
+        are always heavy atoms, so the hydrogens can be placed directly in any order. The dihedral angle is set
+        to the closest cluster center, or kept from the current geometry if it is not parameterized."""
+        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
+            if atom.element != "H":
+                continue
+
+            A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
+            dihedral_angle = self._dihedral(atom, A2, A3, A4)
+            if "dihedral_angle" in atom_parameters:
+                dihedral_angle = self._closest_cluster_center(dihedral_angle, atom_parameters["dihedral_angle"])
             atom.coord = self._compute_atom_position(A2.coord, A3.coord, A4.coord,
                                                      atom_parameters["bond_length"][0],
                                                      atom_parameters["bond_angle"][0],

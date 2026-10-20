@@ -34,6 +34,9 @@ def load_arguments():
                              type=str,
                              metavar='FILE',
                              help='JSON file with parameters. Available parameters are in the "parameters" directory.')
+    preoptimize.add_argument('--only_hydrogens',
+                             action='store_true',
+                             help='Preoptimize only hydrogen atoms, positions of all other atoms are kept.')
 
     parameterize = parser.add_argument_group('arguments for --mode parameterize')
     parameterize.add_argument('--proteins_directory',
@@ -79,7 +82,7 @@ def main():
     args = load_arguments()
     if args.mode == 'preoptimize':
         protein = Protein(args.input_PDB_file)
-        protein.preoptimize(args.parameters)
+        protein.preoptimize(args.parameters, only_hydrogens=args.only_hydrogens)
         protein.save(args.output_PDB_file)
 
     elif args.mode == 'parameterize':
