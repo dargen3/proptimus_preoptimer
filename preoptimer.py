@@ -9,7 +9,7 @@ from src.parameterization import Parameterization
 def load_arguments():
     print("\nParsing arguments... ", end="", flush=True)
     parser = argparse.ArgumentParser(
-        description='PROPTIMUS PREOPTIM: a parameterizable tool for setting bond lengths, '
+        description='PROPTIMUS PREOPTIMER: a parameterizable tool for setting bond lengths, '
                     'bond angles and dihedral angles in protein structures.')
 
     required = parser.add_argument_group('required arguments')

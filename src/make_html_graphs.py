@@ -205,7 +205,7 @@ def _write_index(index_file: Path, files: dict) -> None:
                         for at_name, file_name in atoms.items())
         sections.append(f"<h2>{html.escape(res_name)}</h2><ul>{links}</ul>")
     index_file.write_text(
-        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>PROPTIMUS PREOPTIM graphs</title>"
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>PROPTIMUS PREOPTIMER graphs</title>"
         "<style>body{font-family:sans-serif;margin:2em}ul{display:flex;flex-wrap:wrap;gap:.5em 1.5em;"
         "list-style:none;padding:0}</style></head><body>"
         "<h1>Atom types</h1>" + "".join(sections) + "</body></html>",
