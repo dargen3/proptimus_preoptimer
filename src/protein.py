@@ -1,8 +1,9 @@
 import json
 import warnings
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from contextlib import contextmanager
 from functools import cached_property, lru_cache
+from itertools import permutations
 
 import numpy as np
 from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors  # vectors.calc_dihedral
@@ -142,7 +143,7 @@ class Protein:
 
     # ---------------------------------------------------------------- preoptimization
     def preoptimize(self, parameters_file, only_hydrogens=False):
-        print("Setting bond lengths, bond angles and dihedral angles of hydrogens... ", end="")
+        print("Setting bond lengths, bond angles and dihedral angles... ", end="")
         with open(parameters_file, "r", encoding="utf-8") as f:
             parameters = json.load(f)
         if only_hydrogens:
@@ -169,6 +170,7 @@ class Protein:
 
     def _set_internal_coordinates(self, parameters):
         """Set bond lengths, bond angles and dihedral angles of atoms whose ancestors are all in their own residue."""
+        dihedrals = []
         for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
             if self._has_neighbor_ancestors(atom):
                 continue
@@ -197,10 +199,12 @@ class Protein:
                 current_dihedral = internal_coord.get_angle(dihedral_key)
                 if current_dihedral is None:
                     exit("error dihedral angle")
-                internal_coord.set_angle(dihedral_key,
-                                         self._closest_cluster_center(current_dihedral,
-                                                                      atom_parameters["dihedral_angle"]),
-                                         overlap=False)
+                dihedrals.append((res_i, atom, current_dihedral, atom_parameters["dihedral_angle"], dihedral_key))
+
+        centers = self._assign_cluster_centers((res_i, atom, current, atom_centers)
+                                               for res_i, atom, current, atom_centers, _ in dihedrals)
+        for _, atom, _, _, dihedral_key in dihedrals:
+            atom.get_parent().internal_coord.set_angle(dihedral_key, centers[atom], overlap=False)
 
     def _superimpose_on_original(self):
         """Superimpose the structure with the new coordinates on the original one using CA atoms."""
@@ -214,18 +218,22 @@ class Protein:
 
     def _place_single_bonded_atoms(self, parameters):
         """Place custom atoms (atoms with a single chemical bond) using the closest cluster center of the dihedral."""
+        to_place = []
         for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
             if "dihedral_angle" not in atom_parameters or self._has_neighbor_ancestors(atom):
                 continue
             if "ancestors_type" not in self._type_data(atom):
                 continue
+            to_place.append((res_i, atom, atom_parameters, self._get_ancestor_atoms(res_i, atom)))
 
-            A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
-            current_dihedral = self._dihedral(atom, A2, A3, A4)
-            atom.coord = self._compute_atom_position(
-                A2.coord, A3.coord, A4.coord,
-                atom_parameters["bond_length"][0], atom_parameters["bond_angle"][0],
-                self._closest_cluster_center(current_dihedral, atom_parameters["dihedral_angle"]))
+        centers = self._assign_cluster_centers((res_i, atom, self._dihedral(atom, *ancestors),
+                                                atom_parameters["dihedral_angle"])
+                                               for res_i, atom, atom_parameters, ancestors in to_place)
+        for _, atom, atom_parameters, (A2, A3, A4) in to_place:
+            atom.coord = self._compute_atom_position(A2.coord, A3.coord, A4.coord,
+                                                     atom_parameters["bond_length"][0],
+                                                     atom_parameters["bond_angle"][0],
+                                                     centers[atom])
 
     def _place_atoms_with_neighbor_ancestors(self, parameters, atom_names):
         """Place atoms (C, N, O, H) having ancestors in the previous or the next residue."""
@@ -247,20 +255,52 @@ class Protein:
         """Place only hydrogens, heavy atoms are kept at their original positions. The ancestors of hydrogens
         are always heavy atoms, so the hydrogens can be placed directly in any order. The dihedral angle is set
         to the closest cluster center, or kept from the current geometry if it is not parameterized."""
+        to_place = []
         for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
             if atom.element != "H":
                 continue
+            ancestors = self._get_ancestor_atoms(res_i, atom)
+            to_place.append((res_i, atom, atom_parameters, ancestors, self._dihedral(atom, *ancestors)))
 
-            A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
-            dihedral_angle = self._dihedral(atom, A2, A3, A4)
-            if "dihedral_angle" in atom_parameters:
-                dihedral_angle = self._closest_cluster_center(dihedral_angle, atom_parameters["dihedral_angle"])
+        centers = self._assign_cluster_centers((res_i, atom, current, atom_parameters["dihedral_angle"])
+                                               for res_i, atom, atom_parameters, _, current in to_place
+                                               if "dihedral_angle" in atom_parameters)
+        for _, atom, atom_parameters, (A2, A3, A4), current in to_place:
+            dihedral_angle = centers.get(atom, current)
             atom.coord = self._compute_atom_position(A2.coord, A3.coord, A4.coord,
                                                      atom_parameters["bond_length"][0],
                                                      atom_parameters["bond_angle"][0],
                                                      dihedral_angle)
 
+    def _assign_cluster_centers(self, dihedrals):
+        """Assign a cluster center of the dihedral angle to each atom from (res_i, atom, current dihedral, centers).
+        Equivalent atoms (same atom type and ancestors, e.g. the hydrogens of a methyl group) get different
+        centers, so that they are never placed at the same position. Among these assignments, the one with
+        the smallest total deviation from the current dihedrals is chosen."""
+        groups = defaultdict(list)
+        for res_i, atom, current, centers in dihedrals:
+            groups[(res_i, self.atom_types[atom], self._get_ancestors(atom))].append((atom, current, centers))
+
+        assigned = {}
+        for group in groups.values():
+            centers = group[0][2]
+            if len(group) > len(centers):
+                for atom, current, _ in group:
+                    assigned[atom] = self._closest_cluster_center(current, centers)
+                continue
+            best = min(permutations(range(len(centers)), len(group)),
+                       key=lambda perm: sum(self._angle_distance(current, centers[i])
+                                            for (_, current, _), i in zip(group, perm)))
+            for (atom, _, _), i in zip(group, best):
+                assigned[atom] = centers[i]
+        return assigned
+
     # ---------------------------------------------------------------- geometry
+    @staticmethod
+    def _angle_distance(angle1_deg, angle2_deg):
+        """Absolute difference of two angles in degrees, respecting the periodicity of angles."""
+        return abs((angle1_deg - angle2_deg + 180) % 360 - 180)
+
     @staticmethod
     def _dihedral(atom, a2, a3, a4):
         """Dihedral angle atom-a2-a3-a4 in degrees."""
